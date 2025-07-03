@@ -343,3 +343,45 @@ variable "replication_regions" {
 
 variable "pull_through_cache_rules" {
   description = "List of objects { ecr_repository_prefix, upstream_registry
+===========================================================================================
+variable "ecr_repo_configs" {
+  description = "Map of ECR repo configs per environment"
+  type = map(object({
+    repository_name         = string
+    region                  = string
+    image_tag_mutability    = string
+    scan_on_push            = bool
+    encryption_enabled      = bool
+    kms_key_arn             = string
+    lifecycle_policy        = string
+    repository_policy       = string
+    tags                    = map(string)
+    force_delete            = bool
+    pull_through_cache_rules = list(object({
+      ecr_repository_prefix = string
+      upstream_registry_url = string
+    }))
+  }))
+}
+==============================================================================
+module "ecr_factory" {
+  source = "./modules/aws-ecr/ecr-factory"
+
+  ecr_repo_configs = {
+    "repo-dev" = {
+      repository_name         = "my-app-dev"
+      region                  = "us-east-1"
+      image_tag_mutability    = "IMMUTABLE"
+      scan_on_push            = true
+      encryption_enabled      = false
+      kms_key_arn             = null
+      lifecycle_policy        = file("./policies/dev-lifecycle.json")
+      repository_policy       = file("./policies/dev-repo-policy.json")
+      tags                    = { Environment = "dev" }
+      force_delete            = true
+      pull_through_cache_rules = []
+    }
+  }
+}
+
+
