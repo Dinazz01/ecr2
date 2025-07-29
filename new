@@ -1,0 +1,1967 @@
+# modules/secure_ecr/main.tf
+terraform {
+  required_version = ">= 1.0.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 4.0"
+    }
+  }
+}
+
+resource "aws_ecr_repository" "this" {
+  name                 = var.repository_name
+  image_tag_mutability = var.image_tag_mutability_enabled ? "IMMUTABLE" : "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "KMS"
+    kms_key        = var.kms_key_arn != "" ? var.kms_key_arn : "aws/ecr"
+  }
+
+  tags = var.tags
+}
+
+# AWS Signer Profile for Container Image Signing
+resource "aws_signer_signing_profile" "ecr_signing_profile" {
+  count = var.enable_image_signing ? 1 : 0
+
+  platform_id = "Notation-OCI-SHA384-ECDSA"
+  name_prefix = "${var.repository_name}-signer-"
+
+  signature_validity_period {
+    type  = "YEARS"
+    value = 1
+  }
+
+  tags = merge(var.tags, {
+    Purpose = "ECR image signing"
+  })
+}
+
+# IAM Policy for AWS Signer
+resource "aws_iam_policy" "signer_access_policy" {
+  count = var.enable_image_signing ? 1 : 0
+
+  name        = "${var.repository_name}-ecr-signer-policy"
+  description = "Policy for AWS Signer to sign images in ${var.repository_name}"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "signer:GetSigningProfile",
+          "signer:DescribeSigningJob",
+          "signer:StartSigningJob"
+        ]
+        Resource = aws_signer_signing_profile.ecr_signing_profile[0].arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:DescribeImages",
+          "ecr:DescribeRepositories",
+          "ecr:ListImages"
+        ]
+        Resource = aws_ecr_repository.this.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:GetPublicKey",
+          "kms:Sign"
+        ]
+        Resource = var.signer_kms_key_arn
+      }
+    ]
+  })
+}
+
+# IAM Policy for least privilege ECR access
+resource "aws_iam_policy" "ecr_access_policy" {
+  name        = "${var.repository_name}-ecr-access-policy"
+  description = "Least privilege policy for ${var.repository_name} ECR repository"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:PutImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload"
+        ]
+        Resource = aws_ecr_repository.this.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# Repository policy with signing requirements
+resource "aws_ecr_repository_policy" "this" {
+  repository = aws_ecr_repository.this.name
+  policy     = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = {
+          AWS = var.allowed_principals
+        }
+        Action    = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:BatchCheckLayerAvailability"
+        ]
+      },
+      {
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "*"
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "false"
+          }
+        }
+      },
+      {
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "ecr:PutImage"
+        Condition = {
+          Null = {
+            "ecr:imageTagMutability" = "true"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# VPC Endpoint for private access
+resource "aws_vpc_endpoint" "ecr_api" {
+  count = var.create_vpc_endpoint ? 1 : 0
+
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.${var.region}.ecr.api"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+
+  security_group_ids = var.vpc_endpoint_security_group_ids
+  subnet_ids         = var.vpc_endpoint_subnet_ids
+
+  tags = merge(var.tags, {
+    Name = "${var.repository_name}-ecr-api-endpoint"
+  })
+}
+
+resource "aws_vpc_endpoint" "ecr_dkr" {
+  count = var.create_vpc_endpoint ? 1 : 0
+
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.${var.region}.ecr.dkr"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+
+  security_group_ids = var.vpc_endpoint_security_group_ids
+  subnet_ids         = var.vpc_endpoint_subnet_ids
+
+  tags = merge(var.tags, {
+    Name = "${var.repository_name}-ecr-dkr-endpoint"
+  })
+}
+
+# CloudWatch Events for image scanning and signing
+resource "aws_cloudwatch_event_rule" "ecr_scan" {
+  name        = "${var.repository_name}-ecr-image-scan"
+  description = "Trigger when new image is pushed to ${var.repository_name}"
+
+  event_pattern = jsonencode({
+    source      = ["aws.ecr"]
+    detail-type = ["ECR Image Action"]
+    detail = {
+      "action-type"     = ["PUSH"]
+      "result"         = ["SUCCESS"]
+      "repository-name" = [aws_ecr_repository.this.name]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "ecr_scan_notification" {
+  rule      = aws_cloudwatch_event_rule.ecr_scan.name
+  target_id = "SendToSNS"
+  arn       = var.notification_sns_topic_arn
+}
+
+# Lambda function for automatic image signing
+resource "aws_lambda_function" "ecr_image_signer" {
+  count = var.enable_image_signing ? 1 : 0
+
+  filename      = "${path.module}/lambda/ecr_signer.zip"
+  function_name = "${var.repository_name}-ecr-image-signer"
+  role          = aws_iam_role.lambda_signer[0].arn
+  handler       = "index.handler"
+  runtime       = "python3.9"
+  timeout       = 300
+
+  environment {
+    variables = {
+      SIGNING_PROFILE_ARN = aws_signer_signing_profile.ecr_signing_profile[0].arn
+      REPOSITORY_NAME     = var.repository_name
+    }
+  }
+
+  tags = var.tags
+}
+
+# IAM Role for Lambda signer
+resource "aws_iam_role" "lambda_signer" {
+  count = var.enable_image_signing ? 1 : 0
+
+  name               = "${var.repository_name}-ecr-signer-lambda-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_signer_basic" {
+  count = var.enable_image_signing ? 1 : 0
+
+  role       = aws_iam_role.lambda_signer[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_signer_custom" {
+  count = var.enable_image_signing ? 1 : 0
+
+  role       = aws_iam_role.lambda_signer[0].name
+  policy_arn = aws_iam_policy.signer_access_policy[0].arn
+}
+
+# EventBridge rule to trigger signing on new image push
+resource "aws_cloudwatch_event_rule" "ecr_image_push" {
+  count = var.enable_image_signing ? 1 : 0
+
+  name        = "${var.repository_name}-ecr-image-push"
+  description = "Trigger when new image is pushed to ${var.repository_name}"
+
+  event_pattern = jsonencode({
+    source      = ["aws.ecr"]
+    detail-type = ["ECR Image Action"]
+    detail = {
+      "action-type"     = ["PUSH"]
+      "result"         = ["SUCCESS"]
+      "repository-name" = [aws_ecr_repository.this.name]
+      "image-tag"      = ["latest"] # Or your specific tag pattern
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "trigger_signer_lambda" {
+  count = var.enable_image_signing ? 1 : 0
+
+  rule      = aws_cloudwatch_event_rule.ecr_image_push[0].name
+  target_id = "TriggerLambda"
+  arn       = aws_lambda_function.ecr_image_signer[0].arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge" {
+  count = var.enable_image_signing ? 1 : 0
+
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ecr_image_signer[0].function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.ecr_image_push[0].arn
+}
+
+# AWS Config rule for ECR compliance
+resource "aws_config_config_rule" "ecr_tag_immutability" {
+  count = var.enable_config_rule ? 1 : 0
+
+  name        = "ecr-tag-immutability-${var.repository_name}"
+  description = "Ensure ECR repository has tag immutability enabled"
+
+  source {
+    owner             = "AWS"
+    source_identifier = "ECR_TAG_IMMUTABILITY_ENABLED"
+  }
+
+  scope {
+    compliance_resource_types = ["AWS::ECR::Repository"]
+  }
+
+  depends_on = [aws_ecr_repository.this]
+}
+
+========================================================================
+variables
+
+variable "enable_image_signing" {
+  description = "Enable AWS Signer for container image signing"
+  type        = bool
+  default     = true
+}
+
+variable "signer_kms_key_arn" {
+  description = "ARN of KMS key for signing (required if enable_image_signing is true)"
+  type        = string
+  default     = ""
+}
+
+variable "signature_validity_years" {
+  description = "Number of years signatures should remain valid"
+  type        = number
+  default     = 1
+}
+
+=====================================================
+output
+output "signing_profile_arn" {
+  description = "ARN of the AWS Signer profile"
+  value       = try(aws_signer_signing_profile.ecr_signing_profile[0].arn, "")
+}
+
+output "signing_profile_version" {
+  description = "Current version of the signing profile"
+  value       = try(aws_signer_signing_profile.ecr_signing_profile[0].version, "")
+}
+
+output "image_signer_lambda_arn" {
+  description = "ARN of the image signing Lambda function"
+  value       = try(aws_lambda_function.ecr_image_signer[0].arn, "")
+}
+=======================================================================
+module "secure_ecr_with_signing" {
+  source = "./modules/secure_ecr"
+
+  repository_name              = "my-secure-signed-app"
+  image_tag_mutability_enabled = true
+  allowed_principals           = ["arn:aws:iam::123456789012:role/ci-cd-role"]
+  
+  enable_image_signing         = true
+  signer_kms_key_arn          = "arn:aws:kms:us-east-1:123456789012:key/abcd1234-5678-90ef-ghij-klmnopqrstuv"
+  
+  create_vpc_endpoint          = true
+  vpc_id                       = "vpc-12345678"
+  vpc_endpoint_subnet_ids      = ["subnet-12345678", "subnet-87654321"]
+  
+  notification_sns_topic_arn   = "arn:aws:sns:us-east-1:123456789012:ecr-scan-notifications"
+  tags = {
+    Environment = "production"
+    Team        = "security"
+  }
+}
+
+=======================================================================================================
+
+main
+
+resource "aws_ecr_repository" "this" {
+  name                 = var.name
+  image_tag_mutability = "IMMUTABLE"
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "KMS"
+    kms_key         = var.kms_key_arn
+  }
+
+  force_delete = var.force_delete
+  tags         = var.tags
+}
+
+resource "aws_ecr_repository_policy" "this" {
+  repository = aws_ecr_repository.this.name
+  policy     = file("${path.module}/policies/ecr_repository_policy.json")
+}
+
+resource "aws_cloudwatch_event_rule" "ecr_push" {
+  name        = "${var.name}-ecr-push"
+  description = "Capture ECR push events"
+  event_pattern = jsonencode({
+    source      = ["aws.ecr"],
+    detail-type = ["ECR Image Action"],
+    detail = {
+      "action-type" = ["PUSH"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_log_group" "ecr_logs" {
+  name              = "/aws/ecr/${var.name}"
+  retention_in_days = 90
+}
+
+resource "aws_cloudwatch_event_target" "log_target" {
+  rule      = aws_cloudwatch_event_rule.ecr_push.name
+  arn       = aws_cloudwatch_log_group.ecr_logs.arn
+}
+
+resource "aws_lambda_permission" "allow_events" {
+  statement_id  = "AllowExecutionFromECR"
+  action        = "lambda:InvokeFunction"
+  function_name = var.lambda_function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.ecr_push.arn
+}
+============================================================
+
+var
+
+variable "name" {
+  description = "ECR repository name"
+  type        = string
+}
+
+variable "kms_key_arn" {
+  description = "ARN of the KMS key to encrypt the ECR images"
+  type        = string
+}
+
+variable "force_delete" {
+  description = "Force delete repository (including images)"
+  type        = bool
+  default     = false
+}
+
+variable "lambda_function_name" {
+  description = "Optional: Lambda to trigger for push audit logging"
+  type        = string
+  default     = ""
+}
+
+variable "tags" {
+  description = "Tags to apply to resources"
+  type        = map(string)
+  default     = {}
+}
+============================================================
+out
+
+output "ecr_repository_url" {
+  value = aws_ecr_repository.this.repository_url
+}
+
+============================================
+Policies/ecr_repository_policy.json{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowOnlySpecificIAMRoles",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": [
+          "arn:aws:iam::123456789012:role/ECRAccessRole"
+        ]
+      },
+      "Action": [
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:BatchCheckLayerAvailability"
+      ]
+    }
+  ]
+}
+
+===========================================================
+
+add AWS Signer Profile
+
+resource "aws_signer_signing_profile" "this" {
+  name     = "${var.name}-signing-profile"
+  platform_id = var.signer_platform_id
+  tags     = var.tags
+}
+
+#variables.tf — Add Signer Platform IDvariable "signer_platform_id" {
+  description = "Platform ID used by AWS Signer (e.g., 'AWSLambda-SHA384-ECDSA', 'AWSContainerImage-SHA384-ECDSA')"
+  type        = string
+  default     = "AWSLambda-SHA384-ECDSA"
+}
+# outputs.tf — Add Signing Profile Output
+
+output "signing_profile_arn" {
+  value = aws_signer_signing_profile.this.arn
+}
+
+======================================================================================================
+========================================================================================================
+
++# ECR Repository
++resource "aws_ecr_repository" "this" {
++  name                 = var.repository_name
++  image_tag_mutability = var.image_tag_mutability
++  force_delete         = var.force_delete
++
++  image_scanning_configuration {
++    scan_on_push = var.scan_on_push
++  }
++
++  encryption_configuration {
++    encryption_type = var.encryption_type
++    kms_key         = var.kms_key_id
++  }
++
++  tags = merge(
++    var.tags,
++    {
++      Name = var.repository_name
++    }
++  )
++}
++
++# ECR Repository Policy
++resource "aws_ecr_repository_policy" "this" {
++  count      = var.repository_policy != null ? 1 : 0
++  repository = aws_ecr_repository.this.name
++  policy     = var.repository_policy
++}
++
++# ECR Lifecycle Policy
++resource "aws_ecr_lifecycle_policy" "this" {
++  count      = var.lifecycle_policy != null ? 1 : 0
++  repository = aws_ecr_repository.this.name
++  policy     = var.lifecycle_policy
++}
++
++# Default Lifecycle Policy (if no custom policy provided)
++resource "aws_ecr_lifecycle_policy" "default" {
++  count      = var.lifecycle_policy == null && var.enable_default_lifecycle_policy ? 1 : 0
++  repository = aws_ecr_repository.this.name
++
++  policy = jsonencode({
++    rules = [
++      {
++        rulePriority = 1
++        description  = "Keep last ${var.max_image_count} images"
++        selection = {
++          tagStatus     = "tagged"
++          tagPrefixList = ["v"]
++          countType     = "imageCountMoreThan"
++          countNumber   = var.max_image_count
++        }
++        action = {
++          type = "expire"
++        }
++      },
++      {
++        rulePriority = 2
++        description  = "Delete images older than ${var.max_image_age_days} days"
++        selection = {
++          tagStatus   = "any"
++          countType   = "sinceImagePushed"
++          countUnit   = "days"
++          countNumber = var.max_image_age_days
++        }
++        action = {
++          type = "expire"
++        }
++      },
++      {
++        rulePriority = 3
++        description  = "Keep only latest untagged image"
++        selection = {
++          tagStatus   = "untagged"
++          countType   = "imageCountMoreThan"
++          countNumber = 1
++        }
++        action = {
++          type = "expire"
++        }
++      }
++    ]
++  })
++}
++
++# ECR Registry Scanning Configuration
++resource "aws_ecr_registry_scanning_configuration" "this" {
++  count = var.enable_registry_scanning ? 1 : 0
++
++  scan_type = var.registry_scan_type
++
++  dynamic "rule" {
++    for_each = var.registry_scan_rules
++    content {
++      scan_frequency = rule.value.scan_frequency
++      repository_filter {
++        filter      = rule.value.repository_filter
++        filter_type = rule.value.filter_type
++      }
++    }
++  }
++}
++
++# ECR Replication Configuration
++resource "aws_ecr_replication_configuration" "this" {
++  count = length(var.replication_destinations) > 0 ? 1 : 0
++
++  replication_configuration {
++    dynamic "rule" {
++      for_each = var.replication_destinations
++      content {
++        dynamic "destination" {
++          for_each = rule.value
++          content {
++            region      = destination.value.region
++            registry_id = destination.value.registry_id
++          }
++        }
++        dynamic "repository_filter" {
++          for_each = var.replication_repository_filters
++          content {
++            filter      = repository_filter.value.filter
++            filter_type = repository_filter.value.filter_type
++          }
++        }
++      }
++    }
++  }
++}
++
++# ECR Pull Through Cache Rules
++resource "aws_ecr_pull_through_cache_rule" "this" {
++  for_each = var.pull_through_cache_rules
++
++  ecr_repository_prefix = each.value.ecr_repository_prefix
++  upstream_registry_url = each.value.upstream_registry_url
++  credential_arn        = each.value.credential_arn
++}
++
++# IAM Role for ECR Cross-Account Access (Optional)
++resource "aws_iam_role" "ecr_cross_account" {
++  count = var.create_cross_account_role ? 1 : 0
++  name  = "${var.repository_name}-ecr-cross-account-role"
++
++  assume_role_policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Action = "sts:AssumeRole"
++        Effect = "Allow"
++        Principal = {
++          AWS = var.cross_account_arns
++        }
++      }
++    ]
++  })
++
++  tags = var.tags
++}
++
++# IAM Policy for ECR Cross-Account Access
++resource "aws_iam_role_policy" "ecr_cross_account" {
++  count = var.create_cross_account_role ? 1 : 0
++  name  = "${var.repository_name}-ecr-cross-account-policy"
++  role  = aws_iam_role.ecr_cross_account[0].id
++
++  policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Effect = "Allow"
++        Action = [
++          "ecr:GetDownloadUrlForLayer",
++          "ecr:BatchGetImage",
++          "ecr:BatchCheckLayerAvailability",
++          "ecr:GetRepositoryPolicy",
++          "ecr:DescribeRepositories",
++          "ecr:ListImages",
++          "ecr:DescribeImages",
++          "ecr:BatchDeleteImage",
++          "ecr:GetLifecyclePolicy",
++          "ecr:GetLifecyclePolicyPreview",
++          "ecr:ListTagsForResource",
++          "ecr:DescribeImageScanFindings"
++        ]
++        Resource = aws_ecr_repository.this.arn
++      },
++      {
++        Effect = "Allow"
++        Action = [
++          "ecr:GetAuthorizationToken"
++        ]
++        Resource = "*"
++      }
++    ]
++  })
++}
+================================================================
+output
+diff --git a/modules/ecr/outputs.tf b/modules/ecr/outputs.tf
+--- a/modules/ecr/outputs.tf
++++ b/modules/ecr/outputs.tf
+@@ -0,0 +1,79 @@
++# ECR Repository Outputs
++output "repository_arn" {
++  description = "Full ARN of the repository"
++  value       = aws_ecr_repository.this.arn
++}
++
++output "repository_name" {
++  description = "Name of the repository"
++  value       = aws_ecr_repository.this.name
++}
++
++output "repository_url" {
++  description = "URL of the repository (in the form aws_account_id.dkr.ecr.region.amazonaws.com/repositoryName)"
++  value       = aws_ecr_repository.this.repository_url
++}
++
++output "registry_id" {
++  description = "Registry ID where the repository was created"
++  value       = aws_ecr_repository.this.registry_id
++}
++
++# Repository Policy Outputs
++output "repository_policy" {
++  description = "The repository policy JSON document"
++  value       = try(aws_ecr_repository_policy.this[0].policy, null)
++}
++
++# Lifecycle Policy Outputs
++output "lifecycle_policy" {
++  description = "The lifecycle policy JSON document"
++  value       = try(coalesce(
++    aws_ecr_lifecycle_policy.this[0].policy,
++    aws_ecr_lifecycle_policy.default[0].policy
++  ), null)
++}
++
++# Cross-Account Role Outputs
++output "cross_account_role_arn" {
++  description = "ARN of the cross-account IAM role"
++  value       = try(aws_iam_role.ecr_cross_account[0].arn, null)
++}
++
++output "cross_account_role_name" {
++  description = "Name of the cross-account IAM role"
++  value       = try(aws_iam_role.ecr_cross_account[0].name, null)
++}
++
++# Additional Useful Outputs
++output "repository_registry_url" {
++  description = "The registry URL"
++  value       = split("/", aws_ecr_repository.this.repository_url)[0]
++}
++
++output "repository_image_tag_mutability" {
++  description = "The tag mutability setting for the repository"
++  value       = aws_ecr_repository.this.image_tag_mutability
++}
++
++output "repository_encryption_configuration" {
++  description = "Encryption configuration for the repository"
++  value       = aws_ecr_repository.this.encryption_configuration
++}
++
++output "repository_image_scanning_configuration" {
++  description = "Image scanning configuration for the repository"
++  value       = aws_ecr_repository.this.image_scanning_configuration
++}
++
++# Pull Through Cache Rules Outputs
++output "pull_through_cache_rules" {
++  description = "Map of pull through cache rules"
++  value = {
++    for k, v in aws_ecr_pull_through_cache_rule.this : k => {
++      ecr_repository_prefix = v.ecr_repository_prefix
++      upstream_registry_url = v.upstream_registry_url
++      registry_id          = v.registry_id
++    }
++  }
++}
+
+=============================================================================================
+read me 
+
+diff --git a/modules/ecr/README.md b/modules/ecr/README.md
+--- a/modules/ecr/README.md
++++ b/modules/ecr/README.md
+@@ -0,0 +1,341 @@
++# AWS ECR Terraform Module
++
++This Terraform module creates and manages Amazon Elastic Container Registry (ECR) repositories with comprehensive configuration options including lifecycle policies, image scanning, replication, and security features.
++
++## Features
++
++- ✅ ECR Repository creation with configurable settings
++- ✅ Image scanning configuration (basic and enhanced)
++- ✅ Lifecycle policies (custom or default)
++- ✅ Repository policies for access control
++- ✅ Cross-region replication
++- ✅ Pull-through cache rules
++- ✅ Encryption at rest (AES256 or KMS)
++- ✅ Cross-account access with IAM roles
++- ✅ Registry-level scanning configuration
++- ✅ Comprehensive tagging support
++
++## Usage
++
++### Basic Usage
++
++```hcl
++module "ecr_repository" {
++  source = "./modules/ecr"
++
++  repository_name = "my-app"
++  
++  tags = {
++    Environment = "production"
++    Team        = "platform"
++  }
++}
++```
++
++### Advanced Usage
++
++```hcl
++module "ecr_repository" {
++  source = "./modules/ecr"
++
++  repository_name      = "my-microservice"
++  image_tag_mutability = "IMMUTABLE"
++  scan_on_push        = true
++  encryption_type     = "KMS"
++  kms_key_id          = "arn:aws:kms:us-west-2:123456789012:key/12345678-1234-1234-1234-123456789012"
++  
++  # Custom lifecycle policy
++  lifecycle_policy = jsonencode({
++    rules = [
++      {
++        rulePriority = 1
++        description  = "Keep last 20 production images"
++        selection = {
++          tagStatus     = "tagged"
++          tagPrefixList = ["prod-"]
++          countType     = "imageCountMoreThan"
++          countNumber   = 20
++        }
++        action = {
++          type = "expire"
++        }
++      }
++    ]
++  })
++
++  # Cross-account access
++  create_cross_account_role = true
++  cross_account_arns = [
++    "arn:aws:iam::123456789012:root",
++    "arn:aws:iam::123456789013:root"
++  ]
++
++  # Replication configuration
++  replication_destinations = [
++    [
++      {
++        region      = "us-east-1"
++        registry_id = "123456789012"
++      },
++      {
++        region      = "eu-west-1"
++        registry_id = "123456789012"
++      }
++    ]
++  ]
++
++  # Pull through cache rules
++  pull_through_cache_rules = {
++    dockerhub = {
++      ecr_repository_prefix = "dockerhub"
++      upstream_registry_url = "registry-1.docker.io"
++    }
++    quay = {
++      ecr_repository_prefix = "quay"
++      upstream_registry_url = "quay.io"
++    }
++  }
++
++  tags = {
++    Environment = "production"
++    Team        = "backend"
++    Application = "my-microservice"
++  }
++}
++```
++
++### Multiple Repositories
++
++```hcl
++locals {
++  repositories = {
++    frontend = {
++      repository_name      = "frontend-app"
++      image_tag_mutability = "MUTABLE"
++      max_image_count      = 15
++    }
++    backend = {
++      repository_name      = "backend-api"
++      image_tag_mutability = "IMMUTABLE"
++      max_image_count      = 25
++      max_image_age_days   = 60
++    }
++    worker = {
++      repository_name    = "background-worker"
++      scan_on_push      = false
++      max_image_count   = 5
++    }
++  }
++}
++
++module "ecr_repositories" {
++  source = "./modules/ecr"
++  
++  for_each = local.repositories
++
++  repository_name      = each.value.repository_name
++  image_tag_mutability = try(each.value.image_tag_mutability, "MUTABLE")
++  scan_on_push        = try(each.value.scan_on_push, true)
++  max_image_count     = try(each.value.max_image_count, 10)
++  max_image_age_days  = try(each.value.max_image_age_days, 30)
++
++  tags = {
++    Environment = "production"
++    Service     = each.key
++  }
++}
++```
++
++### Repository with Enhanced Scanning
++
++```hcl
++module "ecr_repository_enhanced" {
++  source = "./modules/ecr"
++
++  repository_name           = "secure-app"
++  enable_registry_scanning  = true
++  registry_scan_type       = "ENHANCED"
++  
++  registry_scan_rules = [
++    {
++      scan_frequency     = "SCAN_ON_PUSH"
++      repository_filter  = "secure-*"
++      filter_type        = "WILDCARD"
++    }
++  ]
++
++  tags = {
++    Security    = "high"
++    Compliance  = "required"
++  }
++}
++```
++
++## Examples
++
++See the [examples](./examples) directory for complete working examples:
++
++- [Basic ECR Repository](./examples/basic)
++- [ECR with Enhanced Security](./examples/enhanced-security)
++- [Multi-Repository Setup](./examples/multi-repository)
++- [Cross-Account Access](./examples/cross-account)
++
++## Requirements
++
++| Name | Version |
++|------|---------|
++| terraform | >= 1.0 |
++| aws | >= 5.0 |
++
++## Providers
++
++| Name | Version |
++|------|---------|
++| aws | >= 5.0 |
++
++## Inputs
++
++| Name | Description | Type | Default | Required |
++|------|-------------|------|---------|:--------:|
++| repository_name | Name of the ECR repository | `string` | n/a | yes |
++| image_tag_mutability | The tag mutability setting for the repository. Must be one of: MUTABLE or IMMUTABLE | `string` | `"MUTABLE"` | no |
++| force_delete | If true, will delete the repository even if it contains images | `bool` | `false` | no |
++| scan_on_push | Indicates whether images are scanned after being pushed to the repository | `bool` | `true` | no |
++| enable_registry_scanning | Enable enhanced scanning for the registry | `bool` | `false` | no |
++| registry_scan_type | The scanning type for the registry. Must be ENHANCED or BASIC | `string` | `"ENHANCED"` | no |
++| registry_scan_rules | List of registry scanning rules | `list(object({...}))` | `[]` | no |
++| encryption_type | The encryption type for the repository. Must be one of: AES256 or KMS | `string` | `"AES256"` | no |
++| kms_key_id | The ARN of the KMS key to use when encryption_type is KMS | `string` | `null` | no |
++| repository_policy | The policy document for the ECR repository | `string` | `null` | no |
++| lifecycle_policy | The policy document for the ECR lifecycle policy | `string` | `null` | no |
++| enable_default_lifecycle_policy | Enable default lifecycle policy if no custom policy is provided | `bool` | `true` | no |
++| max_image_count | Maximum number of images to keep in the repository (for default lifecycle policy) | `number` | `10` | no |
++| max_image_age_days | Maximum age of images in days (for default lifecycle policy) | `number` | `30` | no |
++| replication_destinations | List of replication destinations | `list(list(object({...})))` | `[]` | no |
++| replication_repository_filters | List of repository filters for replication | `list(object({...}))` | `[]` | no |
++| pull_through_cache_rules | Map of pull through cache rules | `map(object({...}))` | `{}` | no |
++| create_cross_account_role | Create IAM role for cross-account access | `bool` | `false` | no |
++| cross_account_arns | List of AWS account ARNs that can assume the cross-account role | `list(string)` | `[]` | no |
++| tags | A map of tags to assign to the resource | `map(string)` | `{}` | no |
++
++## Outputs
++
++| Name | Description |
++|------|-------------|
++| repository_arn | Full ARN of the repository |
++| repository_name | Name of the repository |
++| repository_url | URL of the repository |
++| registry_id | Registry ID where the repository was created |
++| repository_policy | The repository policy JSON document |
++| lifecycle_policy | The lifecycle policy JSON document |
++| cross_account_role_arn | ARN of the cross-account IAM role |
++| cross_account_role_name | Name of the cross-account IAM role |
++| repository_registry_url | The registry URL |
++| repository_image_tag_mutability | The tag mutability setting for the repository |
++| repository_encryption_configuration | Encryption configuration for the repository |
++| repository_image_scanning_configuration | Image scanning configuration for the repository |
++| pull_through_cache_rules | Map of pull through cache rules |
++
++## Best Practices
++
++### Security
++- Enable image scanning (`scan_on_push = true`)
++- Use KMS encryption for sensitive applications
++- Implement proper IAM policies for repository access
++- Use immutable tags for production images (`image_tag_mutability = "IMMUTABLE"`)
++
++### Cost Optimization
++- Configure lifecycle policies to automatically clean up old images
++- Use appropriate image retention periods
++- Monitor repository sizes and costs
++
++### Operational Excellence
++- Use consistent naming conventions
++- Tag all resources appropriately
++- Implement cross-region replication for critical applications
++- Use pull-through cache for frequently used public images
++
++### Example Repository Policy
++
++```json
++{
++  "Version": "2012-10-17",
++  "Statement": [
++    {
++      "Sid": "AllowPushPull",
++      "Effect": "Allow",
++      "Principal": {
++        "AWS": "arn:aws:iam::123456789012:role/ECRRole"
++      },
++      "Action": [
++        "ecr:GetDownloadUrlForLayer",
++        "ecr:BatchGetImage",
++        "ecr:BatchCheckLayerAvailability",
++        "ecr:PutImage",
++        "ecr:InitiateLayerUpload",
++        "ecr:UploadLayerPart",
++        "ecr:CompleteLayerUpload"
++      ]
++    }
++  ]
++}
++```
++
++### Example Lifecycle Policy
++
++```json
++{
++  "rules": [
++    {
++      "rulePriority": 1,
++      "description": "Keep last 10 production images",
++      "selection": {
++        "tagStatus": "tagged",
++        "tagPrefixList": ["prod"],
++        "countType": "imageCountMoreThan",
++        "countNumber": 10
++      },
++      "action": {
++        "type": "expire"
++      }
++    },
++    {
++      "rulePriority": 2,
++      "description": "Delete untagged images older than 1 day",
++      "selection": {
++        "tagStatus": "untagged",
++        "countType": "sinceImagePushed",
++        "countUnit": "days",
++        "countNumber": 1
++      },
++      "action": {
++        "type": "expire"
++      }
++    }
++  ]
++}
++```
++
++## Common Use Cases
++
++1. **Development Environment**: Use mutable tags with relaxed lifecycle policies
++2. **Production Environment**: Use immutable tags with strict lifecycle policies
++3. **Multi-Account Setup**: Configure cross-account access roles
++4. **Multi-Region Deployment**: Set up replication to required regions
++5. **Security Compliance**: Enable enhanced scanning and encryption
++
++## Contributing
++
++1. Fork the repository
++2. Create a feature branch
++3. Make your changes
++4. Add tests if applicable
++5. Submit a pull request
++
++## License
++
++This module is licensed under the MIT License. See LICENSE file for details.
++
++## Support
++
++For questions, issues, or contributions, please refer to the project's GitHub repository.
+
+======================================================================================================
+main 
+diff --git a/modules/ecr-security/main.tf b/modules/ecr-security/main.tf
+--- a/modules/ecr-security/main.tf
++++ b/modules/ecr-security/main.tf
+@@ -0,0 +1,326 @@
++# Enhanced ECR Security Module
++# This module includes additional security features like VPC endpoints, monitoring, and compliance
++
++# ECR Repository (using the base module)
++module "ecr_base" {
++  source = "../ecr"
++
++  repository_name               = var.repository_name
++  image_tag_mutability         = var.image_tag_mutability
++  force_delete                 = var.force_delete
++  scan_on_push                 = var.scan_on_push
++  enable_registry_scanning     = var.enable_registry_scanning
++  registry_scan_type           = var.registry_scan_type
++  registry_scan_rules          = var.registry_scan_rules
++  encryption_type              = var.encryption_type
++  kms_key_id                   = var.kms_key_id
++  repository_policy            = var.repository_policy
++  lifecycle_policy             = var.lifecycle_policy
++  enable_default_lifecycle_policy = var.enable_default_lifecycle_policy
++  max_image_count              = var.max_image_count
++  max_image_age_days           = var.max_image_age_days
++  replication_destinations     = var.replication_destinations
++  replication_repository_filters = var.replication_repository_filters
++  pull_through_cache_rules     = var.pull_through_cache_rules
++  create_cross_account_role    = var.create_cross_account_role
++  cross_account_arns           = var.cross_account_arns
++  tags                         = var.tags
++}
++
++# VPC Endpoints for ECR (if VPC is provided)
++resource "aws_vpc_endpoint" "ecr_api" {
++  count = var.vpc_id != null ? 1 : 0
++
++  vpc_id              = var.vpc_id
++  service_name        = "com.amazonaws.${data.aws_region.current.name}.ecr.api"
++  vpc_endpoint_type   = "Interface"
++  subnet_ids          = var.private_subnet_ids
++  security_group_ids  = [aws_security_group.ecr_endpoint[0].id]
++  
++  policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Effect = "Allow"
++        Principal = "*"
++        Action = [
++          "ecr:GetAuthorizationToken",
++          "ecr:BatchCheckLayerAvailability",
++          "ecr:GetDownloadUrlForLayer",
++          "ecr:BatchGetImage",
++          "ecr:DescribeRepositories",
++          "ecr:DescribeImages",
++          "ecr:ListImages"
++        ]
++        Resource = "*"
++      }
++    ]
++  })
++
++  tags = merge(
++    var.tags,
++    {
++      Name = "${var.repository_name}-ecr-api-endpoint"
++      Type = "ECR-API"
++    }
++  )
++}
++
++resource "aws_vpc_endpoint" "ecr_dkr" {
++  count = var.vpc_id != null ? 1 : 0
++
++  vpc_id              = var.vpc_id
++  service_name        = "com.amazonaws.${data.aws_region.current.name}.ecr.dkr"
++  vpc_endpoint_type   = "Interface"
++  subnet_ids          = var.private_subnet_ids
++  security_group_ids  = [aws_security_group.ecr_endpoint[0].id]
++
++  policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Effect = "Allow"
++        Principal = "*"
++        Action = [
++          "ecr:BatchGetImage",
++          "ecr:GetDownloadUrlForLayer"
++        ]
++        Resource = "*"
++      }
++    ]
++  })
++
++  tags = merge(
++    var.tags,
++    {
++      Name = "${var.repository_name}-ecr-dkr-endpoint"
++      Type = "ECR-DKR"
++    }
++  )
++}
++
++# Security Group for ECR VPC Endpoints
++resource "aws_security_group" "ecr_endpoint" {
++  count = var.vpc_id != null ? 1 : 0
++
++  name_prefix = "${var.repository_name}-ecr-endpoint-"
++  vpc_id      = var.vpc_id
++  description = "Security group for ECR VPC endpoints"
++
++  ingress {
++    description = "HTTPS from VPC"
++    from_port   = 443
++    to_port     = 443
++    protocol    = "tcp"
++    cidr_blocks = [var.vpc_cidr]
++  }
++
++  egress {
++    description = "All outbound traffic"
++    from_port   = 0
++    to_port     = 0
++    protocol    = "-1"
++    cidr_blocks = ["0.0.0.0/0"]
++  }
++
++  tags = merge(
++    var.tags,
++    {
++      Name = "${var.repository_name}-ecr-endpoint-sg"
++    }
++  )
++}
++
++# CloudTrail for ECR API logging
++resource "aws_cloudtrail" "ecr" {
++  count = var.enable_cloudtrail ? 1 : 0
++
++  name           = "${var.repository_name}-ecr-trail"
++  s3_bucket_name = var.cloudtrail_bucket_name
++
++  event_selector {
++    read_write_type                 = "All"
++    include_management_events       = true
++    exclude_management_event_sources = []
++
++    data_resource {
++      type   = "AWS::ECR::Repository"
++      values = [module.ecr_base.repository_arn]
++    }
++  }
++
++  tags = merge(
++    var.tags,
++    {
++      Name = "${var.repository_name}-ecr-trail"
++    }
++  )
++}
++
++# CloudWatch Log Group for ECR audit logs
++resource "aws_cloudwatch_log_group" "ecr_audit" {
++  count = var.enable_cloudwatch_logs ? 1 : 0
++
++  name              = "/aws/ecr/${var.repository_name}/audit"
++  retention_in_days = var.cloudwatch_log_retention_days
++
++  tags = merge(
++    var.tags,
++    {
++      Name = "${var.repository_name}-ecr-audit-logs"
++    }
++  )
++}
++
++# CloudWatch Metric Filters
++resource "aws_cloudwatch_log_metric_filter" "ecr_push" {
++  count = var.enable_cloudwatch_logs ? 1 : 0
++
++  name           = "${var.repository_name}-ecr-image-push"
++  log_group_name = aws_cloudwatch_log_group.ecr_audit[0].name
++  pattern        = "[timestamp, request_id, event_name=\"PutImage\", ...]"
++
++  metric_transformation {
++    name      = "ECRImagePushCount"
++    namespace = "ECR/Security"
++    value     = "1"
++    default_value = "0"
++    
++    dimensions = {
++      RepositoryName = var.repository_name
++    }
++  }
++}
++
++resource "aws_cloudwatch_log_metric_filter" "ecr_unauthorized" {
++  count = var.enable_cloudwatch_logs ? 1 : 0
++
++  name           = "${var.repository_name}-ecr-unauthorized-access"
++  log_group_name = aws_cloudwatch_log_group.ecr_audit[0].name
++  pattern        = "[timestamp, request_id, event_name, error_code=\"UnauthorizedOperation\", ...]"
++
++  metric_transformation {
++    name      = "ECRUnauthorizedAccess"
++    namespace = "ECR/Security"
++    value     = "1"
++    default_value = "0"
++    
++    dimensions = {
++      RepositoryName = var.repository_name
++    }
++  }
++}
++
++# CloudWatch Alarms
++resource "aws_cloudwatch_metric_alarm" "ecr_unauthorized_access" {
++  count = var.enable_security_alarms ? 1 : 0
++
++  alarm_name          = "${var.repository_name}-ecr-unauthorized-access"
++  comparison_operator = "GreaterThanThreshold"
++  evaluation_periods  = "2"
++  metric_name         = "ECRUnauthorizedAccess"
++  namespace           = "ECR/Security"
++  period              = "300"
++  statistic           = "Sum"
++  threshold           = "5"
++  alarm_description   = "Unauthorized access attempts to ECR repository ${var.repository_name}"
++  treat_missing_data  = "notBreaching"
++
++  dimensions = {
++    RepositoryName = var.repository_name
++  }
++
++  alarm_actions = var.security_alarm_actions
++}
++
++resource "aws_cloudwatch_metric_alarm" "ecr_high_storage" {
++  count = var.enable_cost_alarms ? 1 : 0
++
++  alarm_name          = "${var.repository_name}-ecr-high-storage"
++  comparison_operator = "GreaterThanThreshold"
++  evaluation_periods  = "1"
++  metric_name         = "RepositorySizeInBytes"
++  namespace           = "AWS/ECR"
++  period              = "86400"  # 24 hours
++  statistic           = "Average"
++  threshold           = var.storage_threshold_bytes
++  alarm_description   = "ECR repository ${var.repository_name} size exceeds threshold"
++  treat_missing_data  = "notBreaching"
++
++  dimensions = {
++    RepositoryName = var.repository_name
++  }
++
++  alarm_actions = var.cost_alarm_actions
++}
++
++# SNS Topic for Security Alerts (if not provided)
++resource "aws_sns_topic" "security_alerts" {
++  count = var.create_security_topic ? 1 : 0
++  name  = "${var.repository_name}-ecr-security-alerts"
++
++  tags = merge(
++    var.tags,
++    {
++      Name = "${var.repository_name}-security-alerts"
++    }
++  )
++}
++
++resource "aws_sns_topic_subscription" "security_email" {
++  count = var.create_security_topic && length(var.security_notification_emails) > 0 ? length(var.security_notification_emails) : 0
++
++  topic_arn = aws_sns_topic.security_alerts[0].arn
++  protocol  = "email"
++  endpoint  = var.security_notification_emails[count.index]
++}
++
++# Image Signing Profile (AWS Signer)
++resource "aws_signer_signing_profile" "ecr" {
++  count = var.enable_image_signing ? 1 : 0
++
++  platform_id = var.signing_platform_id
++  name        = "${var.repository_name}-signing-profile"
++
++  signature_validity_period {
++    value = var.signature_validity_years
++    type  = "YEARS"
++  }
++
++  tags = merge(
++    var.tags,
++    {
++      Name = "${var.repository_name}-signing-profile"
++    }
++  )
++}
++
++# EventBridge Rule for ECR Events
++resource "aws_cloudwatch_event_rule" "ecr_events" {
++  count = var.enable_eventbridge ? 1 : 0
++
++  name        = "${var.repository_name}-ecr-events"
++  description = "Capture ECR events for repository ${var.repository_name}"
++
++  event_pattern = jsonencode({
++    source      = ["aws.ecr"]
++    detail-type = ["ECR Image Action"]
++    detail = {
++      repository-name = [var.repository_name]
++    }
++  })
++
++  tags = var.tags
++}
++
++resource "aws_cloudwatch_event_target" "sns" {
++  count = var.enable_eventbridge && var.enable_event_notifications ? 1 : 0
++
++  rule      = aws_cloudwatch_event_rule.ecr_events[0].name
++  target_id = "SendToSNS"
++  arn       = var.create_security_topic ? aws_sns_topic.security_alerts[0].arn : var.existing_sns_topic_arn
++}
++
++# Data sources
++data "aws_region" "current" {}
++data "aws_caller_identity" "current" {}
+
+====================================================================================
+diff --git a/examples/enterprise-security/main.tf b/examples/enterprise-security/main.tf
+--- a/examples/enterprise-security/main.tf
++++ b/examples/enterprise-security/main.tf
+@@ -0,0 +1,473 @@
++# Enterprise Security ECR Example
++# This example demonstrates a complete enterprise-grade ECR setup with all security features
++
++terraform {
++  required_version = ">= 1.0"
++  required_providers {
++    aws = {
++      source  = "hashicorp/aws"
++      version = ">= 5.0"
++    }
++  }
++}
++
++provider "aws" {
++  region = var.aws_region
++}
++
++# Data sources
++data "aws_caller_identity" "current" {}
++data "aws_region" "current" {}
++data "aws_availability_zones" "available" {
++  state = "available"
++}
++
++# VPC for secure networking
++resource "aws_vpc" "ecr" {
++  cidr_block           = "10.0.0.0/16"
++  enable_dns_hostnames = true
++  enable_dns_support   = true
++
++  tags = {
++    Name = "ecr-enterprise-vpc"
++  }
++}
++
++# Private subnets for VPC endpoints
++resource "aws_subnet" "private" {
++  count = 2
++
++  vpc_id            = aws_vpc.ecr.id
++  cidr_block        = "10.0.${count.index + 1}.0/24"
++  availability_zone = data.aws_availability_zones.available.names[count.index]
++
++  tags = {
++    Name = "ecr-private-subnet-${count.index + 1}"
++    Type = "Private"
++  }
++}
++
++# Internet Gateway
++resource "aws_internet_gateway" "ecr" {
++  vpc_id = aws_vpc.ecr.id
++
++  tags = {
++    Name = "ecr-enterprise-igw"
++  }
++}
++
++# Route table for private subnets
++resource "aws_route_table" "private" {
++  vpc_id = aws_vpc.ecr.id
++
++  tags = {
++    Name = "ecr-private-rt"
++  }
++}
++
++resource "aws_route_table_association" "private" {
++  count = length(aws_subnet.private)
++
++  subnet_id      = aws_subnet.private[count.index].id
++  route_table_id = aws_route_table.private.id
++}
++
++# KMS key for ECR encryption
++resource "aws_kms_key" "ecr" {
++  description             = "ECR encryption key for enterprise repository"
++  deletion_window_in_days = 7
++  enable_key_rotation     = true
++
++  policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Sid    = "Enable IAM User Permissions"
++        Effect = "Allow"
++        Principal = {
++          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
++        }
++        Action   = "kms:*"
++        Resource = "*"
++      },
++      {
++        Sid    = "Allow ECR Service"
++        Effect = "Allow"
++        Principal = {
++          Service = "ecr.amazonaws.com"
++        }
++        Action = [
++          "kms:Decrypt",
++          "kms:GenerateDataKey"
++        ]
++        Resource = "*"
++      }
++    ]
++  })
++
++  tags = {
++    Name        = "ECR-Enterprise-Encryption-Key"
++    Environment = "production"
++  }
++}
++
++resource "aws_kms_alias" "ecr" {
++  name          = "alias/ecr-enterprise-encryption"
++  target_key_id = aws_kms_key.ecr.key_id
++}
++
++# S3 bucket for CloudTrail logs
++resource "aws_s3_bucket" "cloudtrail" {
++  bucket        = "${data.aws_caller_identity.current.account_id}-ecr-cloudtrail-${random_id.bucket_suffix.hex}"
++  force_destroy = true
++
++  tags = {
++    Name = "ECR-CloudTrail-Logs"
++  }
++}
++
++resource "aws_s3_bucket_policy" "cloudtrail" {
++  bucket = aws_s3_bucket.cloudtrail.id
++
++  policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Sid    = "AWSCloudTrailAclCheck"
++        Effect = "Allow"
++        Principal = {
++          Service = "cloudtrail.amazonaws.com"
++        }
++        Action   = "s3:GetBucketAcl"
++        Resource = aws_s3_bucket.cloudtrail.arn
++      },
++      {
++        Sid    = "AWSCloudTrailWrite"
++        Effect = "Allow"
++        Principal = {
++          Service = "cloudtrail.amazonaws.com"
++        }
++        Action   = "s3:PutObject"
++        Resource = "${aws_s3_bucket.cloudtrail.arn}/*"
++        Condition = {
++          StringEquals = {
++            "s3:x-amz-acl" = "bucket-owner-full-control"
++          }
++        }
++      }
++    ]
++  })
++}
++
++resource "aws_s3_bucket_server_side_encryption_configuration" "cloudtrail" {
++  bucket = aws_s3_bucket.cloudtrail.id
++
++  rule {
++    apply_server_side_encryption_by_default {
++      sse_algorithm = "AES256"
++    }
++  }
++}
++
++resource "aws_s3_bucket_public_access_block" "cloudtrail" {
++  bucket = aws_s3_bucket.cloudtrail.id
++
++  block_public_acls       = true
++  block_public_policy     = true
++  ignore_public_acls      = true
++  restrict_public_buckets = true
++}
++
++resource "random_id" "bucket_suffix" {
++  byte_length = 4
++}
++
++# Enterprise ECR Repository with full security features
++module "ecr_enterprise" {
++  source = "../../modules/ecr-security"
++
++  repository_name      = var.repository_name
++  image_tag_mutability = "IMMUTABLE"
++  scan_on_push        = true
++  encryption_type     = "KMS"
++  kms_key_id          = aws_kms_key.ecr.arn
++
++  # Enhanced scanning
++  enable_registry_scanning = true
++  registry_scan_type      = "ENHANCED"
++  
++  registry_scan_rules = [
++    {
++      scan_frequency     = "SCAN_ON_PUSH"
++      repository_filter  = var.repository_name
++      filter_type        = "WILDCARD"
++    },
++    {
++      scan_frequency     = "CONTINUOUS_SCAN"
++      repository_filter  = var.repository_name
++      filter_type        = "WILDCARD"
++    }
++  ]
++
++  # Strict lifecycle policy for production
++  lifecycle_policy = jsonencode({
++    rules = [
++      {
++        rulePriority = 1
++        description  = "Keep last 10 production images"
++        selection = {
++          tagStatus     = "tagged"
++          tagPrefixList = ["v", "release-", "prod-"]
++          countType     = "imageCountMoreThan"
++          countNumber   = 10
++        }
++        action = {
++          type = "expire"
++        }
++      },
++      {
++        rulePriority = 2
++        description  = "Keep staging images for 7 days"
++        selection = {
++          tagStatus     = "tagged"
++          tagPrefixList = ["staging-", "dev-"]
++          countType     = "sinceImagePushed"
++          countUnit     = "days"
++          countNumber   = 7
++        }
++        action = {
++          type = "expire"
++        }
++      },
++      {
++        rulePriority = 3
++        description  = "Delete untagged images after 1 day"
++        selection = {
++          tagStatus   = "untagged"
++          countType   = "sinceImagePushed"
++          countUnit   = "days"
++          countNumber = 1
++        }
++        action = {
++          type = "expire"
++        }
++      }
++    ]
++  })
++
++  # Repository policy with strict access control
++  repository_policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [
++      {
++        Sid    = "DenyAnonymousAccess"
++        Effect = "Deny"
++        Principal = "*"
++        Action = "*"
++        Resource = "*"
++        Condition = {
++          StringNotEquals = {
++            "aws:PrincipalType" = ["User", "AssumedRole"]
++          }
++        }
++      },
++      {
++        Sid    = "AllowProductionAccess"
++        Effect = "Allow"
++        Principal = {
++          AWS = var.production_role_arns
++        }
++        Action = [
++          "ecr:GetDownloadUrlForLayer",
++          "ecr:BatchGetImage",
++          "ecr:BatchCheckLayerAvailability"
++        ]
++      },
++      {
++        Sid    = "AllowPushFromCI"
++        Effect = "Allow"
++        Principal = {
++          AWS = var.ci_role_arns
++        }
++        Action = [
++          "ecr:GetDownloadUrlForLayer",
++          "ecr:BatchGetImage",
++          "ecr:BatchCheckLayerAvailability",
++          "ecr:PutImage",
++          "ecr:InitiateLayerUpload",
++          "ecr:UploadLayerPart",
++          "ecr:CompleteLayerUpload"
++        ]
++      }
++    ]
++  })
++
++  # Cross-region replication for DR
++  replication_destinations = [
++    [
++      {
++        region      = var.dr_region
++        registry_id = data.aws_caller_identity.current.account_id
++      }
++    ]
++  ]
++
++  # Pull-through cache for public images
++  pull_through_cache_rules = {
++    dockerhub = {
++      ecr_repository_prefix = "dockerhub"
++      upstream_registry_url = "registry-1.docker.io"
++    }
++    public_ecr = {
++      ecr_repository_prefix = "public"
++      upstream_registry_url = "public.ecr.aws"
++    }
++  }
++
++  # VPC configuration for private endpoints
++  vpc_id             = aws_vpc.ecr.id
++  private_subnet_ids = aws_subnet.private[*].id
++  vpc_cidr           = aws_vpc.ecr.cidr_block
++
++  # CloudTrail logging
++  enable_cloudtrail       = true
++  cloudtrail_bucket_name  = aws_s3_bucket.cloudtrail.bucket
++
++  # CloudWatch monitoring
++  enable_cloudwatch_logs        = true
++  cloudwatch_log_retention_days = 365  # 1 year retention for compliance
++
++  # Security and cost alarms
++  enable_security_alarms = true
++  enable_cost_alarms     = true
++  storage_threshold_bytes = 5368709120  # 5GB threshold
++
++  # SNS notifications
++  create_security_topic        = true
++  security_notification_emails = var.security_notification_emails
++
++  # EventBridge for real-time monitoring
++  enable_eventbridge        = true
++  enable_event_notifications = true
++
++  # Image signing for integrity
++  enable_image_signing       = true
++  signing_platform_id        = "AWSLambda-SHA384-ECDSA"
++  signature_validity_years   = 5
++
++  tags = {
++    Environment   = "production"
++    Security      = "enterprise"
++    Compliance    = "required"
++    Team          = "platform"
++    Application   = var.repository_name
++    BackupPolicy  = "required"
++    DataClass     = "confidential"
++  }
++}
++
++# Additional SNS topic for cost alerts
++resource "aws_sns_topic" "cost_alerts" {
++  name = "${var.repository_name}-cost-alerts"
++
++  tags = {
++    Name = "${var.repository_name}-cost-alerts"
++  }
++}
++
++resource "aws_sns_topic_subscription" "cost_email" {
++  count = length(var.cost_notification_emails)
++
++  topic_arn = aws_sns_topic.cost_alerts.arn
++  protocol  = "email"
++  endpoint  = var.cost_notification_emails[count.index]
++}
++
++# Custom CloudWatch dashboard for monitoring
++resource "aws_cloudwatch_dashboard" "ecr" {
++  dashboard_name = "${var.repository_name}-ecr-dashboard"
++
++  dashboard_body = jsonencode({
++    widgets = [
++      {
++        type   = "metric"
++        x      = 0
++        y      = 0
++        width  = 12
++        height = 6
++
++        properties = {
++          metrics = [
++            ["AWS/ECR", "RepositorySizeInBytes", "RepositoryName", var.repository_name],
++            [".", "RepositoryPullCount", ".", "."],
++            [".", "RepositoryPushCount", ".", "."]
++          ]
++          view    = "timeSeries"
++          stacked = false
++          region  = data.aws_region.current.name
++          title   = "ECR Repository Metrics"
++          period  = 300
++        }
++      },
++      {
++        type   = "log"
++        x      = 0
++        y      = 6
++        width  = 12
++        height = 6
++
++        properties = {
++          query   = "SOURCE '/aws/ecr/${var.repository_name}/audit' | fields @timestamp, @message | sort @timestamp desc | limit 100"
++          region  = data.aws_region.current.name
++          title   = "Recent ECR Events"
++        }
++      }
++    ]
++  })
++}
++
++# Outputs
++output "repository_url" {
++  description = "ECR repository URL"
++  value       = module.ecr_enterprise.repository_url
++}
++
++output "repository_arn" {
++  description = "ECR repository ARN"
++  value       = module.ecr_enterprise.repository_arn
++}
++
++output "security_features_enabled" {
++  description = "Summary of enabled security features"
++  value       = module.ecr_enterprise.security_features_enabled
++}
++
++output "compliance_info" {
++  description = "Compliance and security posture"
++  value       = module.ecr_enterprise.compliance_info
++}
++
++output "vpc_endpoint_api_id" {
++  description = "VPC endpoint ID for ECR API"
++  value       = module.ecr_enterprise.vpc_endpoint_ecr_api_id
++}
++
++output "cloudtrail_arn" {
++  description = "CloudTrail ARN for ECR logging"
++  value       = module.ecr_enterprise.cloudtrail_arn
++}
++
++output "signing_profile_arn" {
++  description = "AWS Signer profile ARN"
++  value       = module.ecr_enterprise.signing_profile_arn
++}
++
++output "kms_key_arn" {
++  description = "KMS key ARN for encryption"
++  value       = aws_kms_key.ecr.arn
++}
++
++output "dashboard_url" {
++  description = "CloudWatch dashboard URL"
++  value       = "https://${data.aws_region.current.name}.console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.name}#dashboards:name=${aws_cloudwatch_dashboard.ecr.dashboard_name}"
++}
+
+
+=====================================================
+
