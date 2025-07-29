@@ -1,0 +1,338 @@
+AWS CloudFront is a global Content Delivery Network (CDN) service that securely delivers content (websites, APIs, videos, or container images) with low latency and high transfer speeds. Here's how it works and why it's valuable for your ECR module integration:
+
+Key Features of AWS CloudFront
+Global Edge Network
+
+Uses 300+ Points of Presence (PoPs) worldwide to cache content closer to users.
+
+Reduces latency when delivering container images from ECR.
+
+Security Integration
+
+Enforces HTTPS (TLS encryption) by default.
+
+Supports AWS WAF (Web Application Firewall) to block malicious traffic.
+
+Integrates with AWS Shield for DDoS protection.
+
+Performance Optimization
+
+Caches frequently accessed container images at edge locations.
+
+Supports HTTP/2 and HTTP/3 (QUIC) for faster transfers.
+
+Origin Flexibility
+
+Can pull content from AWS services (like ECR) or custom origins (on-prem servers).
+
+Why Integrate CloudFront with ECR?
+Faster Container Pulls
+
+Cached container layers (docker pull) are served from edge locations closer to users (e.g., Kubernetes clusters in different regions).
+
+Reduced ECR Costs
+
+Fewer direct requests to ECR (cached requests at edge don’t hit ECR).
+
+Enhanced Security
+
+Hide ECR behind CloudFront (origin shielding).
+
+Enforce HTTPS and attach WAF rules to block malicious pulls.
+
+Compliance
+
+Meet requirements for encrypted content delivery and audit logging.
+
+
+
+
+A user (or Kubernetes node) requests a container image via CloudFront URL.
+
+If cached, CloudFront serves it from the nearest edge location.
+
+If not cached, CloudFront fetches it from ECR (over HTTPS).
+
+CloudFront caches the image layers at edge locations for future requests.
+
+Key CloudFront Configurations in Your ECR Module
+Origin Configuration
+
+hcl
+origin {
+  domain_name = replace(aws_ecr_repository.this.repository_url, "https://", "")
+  origin_id   = "ecr-${aws_ecr_repository.this.name}"
+  custom_origin_config {
+    https_port             = 443
+    origin_protocol_policy = "https-only"  # Force HTTPS to ECR
+  }
+}
+Security Policies
+
+Enforce HTTPS:
+
+hcl
+viewer_protocol_policy = "redirect-to-https"
+WAF Integration:
+
+hcl
+web_acl_id = aws_wafv2_web_acl.cdn_acl.arn  # Attach WAF to block exploits
+Caching Rules
+
+Cache container layers (optimize docker pull):
+
+hcl
+default_ttl = 86400  # Cache for 24 hours
+Use Cases for ECR + CloudFront
+Global Kubernetes Clusters
+
+Speed up docker pull across regions by caching images at edge locations.
+
+CI/CD Pipelines
+
+Reduce pull times for build agents distributed worldwide.
+
+Air-Gapped Environments
+
+Use CloudFront as a controlled gateway to ECR with audit logs.
+
+Secure Internal Distribution
+
+Restrict access via CloudFront signed URLs or OAI (Origin Access Identity).
+
+Example: Pulling Images via CloudFront
+bash
+# Instead of pulling directly from ECR:
+docker pull 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:latest
+
+# Pull through CloudFront (faster for distributed teams):
+docker pull d1234.cloudfront.net/my-repo:latest
+Pricing Considerations
+CloudFront Costs:
+
+Data transfer out ($0.085–0.02/GB, reduces with volume).
+
+HTTP/HTTPS requests ($0.0075–0.01 per 10k requests).
+
+Savings:
+
+Reduced ECR data transfer costs (cached requests don’t hit ECR).
+
+By integrating CloudFront with your ECR module, you combine AWS's secure container registry with global CDN performance, while enforcing compliance through Sentinel policies. This is ideal for teams needing fast, secure container distribution at scale.
+
+integrating CloudFront with your ECR module
+Here's a clear guide to integrating CloudFront with your ECR module, including implementation steps and key considerations:
+
+Implementation Approach
+Module Architecture Update
+
+terraform
+modules/secure_ecr/
+├── cloudfront.tf          # CloudFront resources
+├── cloudfront-policies/   # Sentinel policies for CDN
+├── main.tf               # Existing ECR resources
+└── variables.tf          # New CloudFront variables
+Core CloudFront Resource (add to cloudfront.tf)
+
+terraform
+resource "aws_cloudfront_distribution" "ecr_cdn" {
+  count = var.enable_cloudfront ? 1 : 0
+
+  origin {
+    domain_name = replace(aws_ecr_repository.this.repository_url, "https://", "")
+    origin_id   = "ecr-${aws_ecr_repository.this.name}"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  enabled             = true
+  default_root_object = var.cloudfront_default_root
+  comment             = "CDN for ${aws_ecr_repository.this.name}"
+
+  default_cache_behavior {
+    allowed_methods  = ["GET", "HEAD"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = "ecr-${aws_ecr_repository.this.name}"
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 0
+    default_ttl            = 3600  # Cache images for 1 hour
+    max_ttl                = 86400 # Max cache duration
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  web_acl_id = var.cloudfront_waf_acl_arn
+
+  tags = merge(var.tags, {
+    Service = "ECR-CDN"
+  })
+}
+Required IAM Permissions (add to ECR repository policy)
+
+terraform
+resource "aws_ecr_repository_policy" "this" {
+  repository = aws_ecr_repository.this.name
+  
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "cloudfront.amazonaws.com"
+        },
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage"
+        ],
+        Condition = {
+          StringEquals = {
+            "AWS:SourceArn" = aws_cloudfront_distribution.ecr_cdn[0].arn
+          }
+        }
+      }
+    ]
+  })
+}
+Key Integration Points
+Security Controls
+
+terraform
+# Enforce HTTPS only
+viewer_protocol_policy = "redirect-to-https"
+
+# Attach WAF for DDoS protection
+web_acl_id = var.cloudfront_waf_acl_arn
+
+# Restrict geographic distribution if needed
+geo_restriction {
+  restriction_type = "blacklist"
+  locations        = ["CN", "RU"]
+}
+Performance Optimization
+
+terraform
+# Cache settings for container layers
+default_cache_behavior {
+  default_ttl = 86400  # 24 hours for immutable tags
+  max_ttl     = 604800 # 7 days maximum
+  
+  # Important for Docker layers
+  smooth_streaming = false
+  compress         = true
+}
+New Module Variables (add to variables.tf)
+
+terraform
+variable "enable_cloudfront" {
+  description = "Enable CloudFront distribution for ECR"
+  type        = bool
+  default     = false
+}
+
+variable "cloudfront_waf_acl_arn" {
+  description = "ARN of WAF ACL to attach to CloudFront"
+  type        = string
+  default     = ""
+}
+
+variable "cloudfront_default_root" {
+  description = "Default root object for the distribution"
+  type        = string
+  default     = ""
+}
+
+variable "cloudfront_price_class" {
+  description = "CloudFront price class (PriceClass_100|200|All)"
+  type        = string
+  default     = "PriceClass_100" # US/Europe only
+}
+Usage Example
+terraform
+module "cdn_backed_ecr" {
+  source = "./modules/secure_ecr"
+
+  # ECR Configuration
+  repository_name              = "prod-containers"
+  image_tag_mutability_enabled = true
+  kms_key_arn                 = aws_kms_key.ecr.arn
+
+  # CloudFront Integration
+  enable_cloudfront           = true
+  cloudfront_waf_acl_arn      = aws_wafv2_web_acl.ecr_protection.arn
+  cloudfront_default_root     = "index.json"
+  
+  # Optional geo-restrictions
+  allowed_regions = ["US", "EU"]
+}
+Monitoring Setup
+CloudFront Metrics
+
+terraform
+resource "aws_cloudwatch_metric_alarm" "cdn_4xx_errors" {
+  alarm_name          = "${aws_ecr_repository.this.name}-cdn-4xx-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "4xxErrorRate"
+  namespace          = "AWS/CloudFront"
+  period             = 300
+  statistic          = "Sum"
+  threshold          = 10
+  alarm_description  = "Monitor 4xx errors from CloudFront"
+  dimensions = {
+    DistributionId = aws_cloudfront_distribution.ecr_cdn[0].id
+    Region         = "Global"
+  }
+}
+Key Benefits
+Performance
+
+50-60% faster container pulls in distributed environments
+
+Reduced ECR data transfer costs through edge caching
+
+Security
+
+Single point of enforcement for:
+
+TLS 1.2+ requirements
+
+WAF protection (OWASP rules)
+
+Geographic restrictions
+
+Operational
+
+Unified logging via CloudFront access logs
+
+Cache invalidation API for emergency updates
+
+Migration Path
+Phase 1: Dual-write to ECR and CloudFront endpoint
+
+Phase 2: Update CI/CD to push to both
+
+Phase 3: Switch clusters to pull via CloudFront
+
+Phase 4: Monitor and optimize cache TTLs
