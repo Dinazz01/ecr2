@@ -341,6 +341,45 @@ Always scan on push.
 
 Avoid hardcoded ARNs by composing them from account/partition.
 
+###########################################################################
+
+locals {
+  signing_name_prefix = "signer"
+
+  # Environment abbreviation (sanitize just in case)
+  env_abbrv = lower(replace(var.environment_abbr, "/[^a-zA-Z0-9]/", ""))
+
+  # --- Region abbreviation ---
+  # Remove all dashes: "us-east-1" -> "useast1"
+  region_compact = replace(var.region, "-", "")
+
+  # Apply regex to break into parts:
+  # e.g., us-east-1 -> ["us", "east", "1"]
+  region_parts = regexall("([a-z]+)([a-z]+)?(\\d+)", local.region_compact)
+
+  # Build abbreviation:
+  # - Take first 2 letters of first segment ("us")
+  # - Take first letter of second segment ("e", "w", "c", etc.)
+  # - Append the number ("1", "2")
+  region_abbr = "${substr(local.region_parts[0][0], 0, 2)}${substr(local.region_parts[0][1], 0, 1)}${local.region_parts[0][2]}"
+
+  # Optional custom name cleaned
+  cleaned_signing_profile_name = var.signing_profile_name != null ? (
+    lower(replace(var.signing_profile_name, "/[^a-zA-Z0-9]/", ""))
+  ) : var.name != null ? lower(replace(var.name, "/[^a-zA-Z0-9]/", "")) : ""
+
+  # Raw readable version (with dashes)
+  raw_string = "signer-${local.env_abbrv}-${local.region_abbr}-${local.cleaned_signing_profile_name}"
+
+  # AWS-valid version (alphanumeric only, <=64 chars)
+  signing_profile_name = substr(
+    lower(replace(local.raw_string, "/[^a-z0-9]/", "")),
+    0,
+    64
+  )
+}
+
+
 
 
 
