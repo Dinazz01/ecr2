@@ -378,7 +378,35 @@ locals {
     64
   )
 }
+================================================================
+locals {
+  signing_name_prefix = "signer"
 
+  # Environment abbreviation (already sanitized)
+  env_abbrv = lower(replace(var.environment_abbr, "/[^a-zA-Z0-9]/", ""))
+
+  # Region abbreviation using regex:
+  # Example: us-east-1 -> use1, us-west-2 -> usw2, eu-central-1 -> euc1
+  region_abbr = one([
+    for m in regex("([a-z]{2})-([a-z]+)-([0-9]+)", var.region) :
+    "${m[0]}${substr(m[1], 0, 1)}${m[2]}"
+  ])
+
+  # Optional custom name cleaned
+  cleaned_signing_profile_name = var.signing_profile_name != null ? (
+    lower(replace(var.signing_profile_name, "/[^a-zA-Z0-9]/", ""))
+  ) : lower(replace(var.name, "/[^a-zA-Z0-9]/", ""))
+
+  # Raw friendly string
+  raw_string = "${local.signing_name_prefix}-${local.env_abbrv}-${local.region_abbr}-${local.cleaned_signing_profile_name}"
+
+  # AWS-valid (strict alphanumeric, max 64 chars)
+  signing_profile_name = substr(
+    lower(replace(local.raw_string, "/[^a-z0-9]/", "")),
+    0,
+    64
+  )
+}
 
 
 
